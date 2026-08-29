@@ -1,0 +1,9 @@
+resources/
+paper/edit.txt
+analysis/wordcount.py
+analysis/make_pdf.ps1
+__pycache__/
+*.pyc
+.venv/
+venv/
+~$*
