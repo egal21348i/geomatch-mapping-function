@@ -1,12 +1,17 @@
 """
 The case-level objective in GeoMatch-style refugee assignment.
 
-Compares three case-level mapping functions phi that aggregate individual
+Compares the case-level mapping functions phi that aggregate individual
 predicted employment probabilities to a household ("case") score:
 
     at-least-one : phi(p) = 1 - prod(1 - p_i)      [Bansak et al. 2018, default]
     mean         : phi(p) = mean(p_i)
+    sum          : phi(p) = sum(p_i)               [Ahani et al. 2021, Annie MOORE]
     maxmin       : phi(p) = min(p_i)
+
+sum and mean induce the same assignment whenever all cases have the same size
+(the costs differ by a positive affine transform), so they are distinguished
+only in the variable-size analysis; sum_vs_mean_check() verifies this.
 
 The matching stage mirrors the published replication code: each canton is
 replicated as many times as it has slots, cost = 1 - phi, then a 1:1 optimal
@@ -16,13 +21,22 @@ Calibration targets (published aggregates):
   - cantonal capacity shares: Anhang 3 AsylV 1 (population-proportional key)
   - employment rate 7 years after entry, 2018 entry cohort, age 16-55 at entry:
     men 64%, women 32% (SEM, Erwerbssituation von VA/FL)
+  - SIGMA_IDIO, the spread of person-by-canton idiosyncratic match quality, is
+    pinned so that the deployed at-least-one rule reproduces the employment
+    gain over the status quo reported for the U.S. backtest (41%, Bansak et al.
+    2018). See calibration(). Without this term every person of a given gender
+    ranks the cantons identically, the achievable gain collapses to ~1%, and
+    the rank results below are driven by that degeneracy rather than by the
+    objective; size_effect_idio() shows which conclusions depend on it.
 
 Cantonal main effects and canton-by-gender interactions are stylized; the
 Monte Carlo over their draws is what makes the conclusion parameter-free.
 """
 
+from functools import lru_cache
+
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import brentq, linear_sum_assignment
 
 RNG = np.random.default_rng(20260827)
 
@@ -39,6 +53,9 @@ P_MALE, P_FEMALE = 0.64, 0.32          # SEM monitoring, 2018 cohort
 SIGMA_INDIV = 0.5                       # individual heterogeneity (logit scale)
 SIGMA_CANTON = 0.30                     # canton main effect (logit scale)
 SIGMA_INTERACT = 0.30                   # canton-by-gender interaction (logit scale)
+RHO_CASE = 0.0                          # share of individual variance shared within a case
+SIGMA_IDIO = 1.0                        # person-by-canton match quality, calibrated
+                                        # to the published 41% gain; see calibration()
 
 
 def logit(p):
@@ -49,6 +66,24 @@ def expit(x):
     return 1 / (1 + np.exp(-x))
 
 
+@lru_cache(maxsize=None)
+def intercept_for(target, sigma):
+    """Logit-scale intercept a solving E[expit(a + sigma*Z)] = target, Z standard
+    normal, by Gauss-Hermite quadrature.
+
+    Without this, adding person-level noise pulls the marginal employment rates
+    toward 0.5 (Jensen), so the SEM base rates of 0.64/0.32 would hold only at
+    sigma = 0 and the specifications compared in calibration() would differ in
+    their marginal rates as well as in their synergies.
+    """
+    if sigma == 0:
+        return logit(target)
+    nodes, weights = np.polynomial.hermite_e.hermegauss(64)
+    w = weights / weights.sum()
+    return brentq(lambda a: float((w * expit(a + sigma * nodes)).sum()) - target,
+                  -12, 12, xtol=1e-12)
+
+
 def phi_at_least_one(p):
     """P(at least one member employed), assuming within-case independence."""
     return 1 - np.prod(1 - p, axis=-1)
@@ -56,6 +91,11 @@ def phi_at_least_one(p):
 
 def phi_mean(p):
     return p.mean(axis=-1)
+
+
+def phi_sum(p):
+    """Expected number of employed members: the Annie MOORE case-level metric."""
+    return p.sum(axis=-1)
 
 
 def phi_maxmin(p):
@@ -69,8 +109,24 @@ RULES = {
 }
 
 
-def draw_probabilities(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG):
-    """Return p of shape (n_cases, n_cantons, 2); member 0 = man, 1 = woman."""
+def draw_individual_effects(n_cases, n_members, rho, rng):
+    """Individual logit-scale effects with a share rho of variance shared
+    within the case (members of one household resembling each other)."""
+    if rho == 0.0:
+        return rng.normal(0, SIGMA_INDIV, (n_cases, n_members))
+    shared = rng.normal(0, SIGMA_INDIV, (n_cases, 1))
+    own = rng.normal(0, SIGMA_INDIV, (n_cases, n_members))
+    return np.sqrt(rho) * shared + np.sqrt(1 - rho) * own
+
+
+def draw_probabilities(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG,
+                       rho_case=RHO_CASE, sigma_idio=SIGMA_IDIO):
+    """Return p of shape (n_cases, n_cantons, 2); member 0 = man, 1 = woman.
+
+    sigma_idio adds person-by-canton idiosyncratic match quality: with
+    sigma_idio=0 every person of a given gender ranks the cantons identically,
+    which is the restriction discussed in the note on the simulated data.
+    """
     n_cantons = len(CANTON_KEY)
 
     beta = rng.normal(0, SIGMA_CANTON, n_cantons)
@@ -78,15 +134,19 @@ def draw_probabilities(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG):
     delta = rng.normal(0, sigma_interact, n_cantons)
     delta -= delta.mean()
 
-    u = rng.normal(0, SIGMA_INDIV, (n_cases, 2))
+    u = draw_individual_effects(n_cases, 2, rho_case, rng)
 
-    base = np.array([logit(P_MALE), logit(P_FEMALE)])
+    sigma_person = np.hypot(SIGMA_INDIV, sigma_idio)
+    base = np.array([intercept_for(P_MALE, sigma_person),
+                     intercept_for(P_FEMALE, sigma_person)])
     sign = np.array([-1.0, 1.0])          # interaction shifts women up, men down
 
     lin = (base[None, None, :]
            + u[:, None, :]
            + beta[None, :, None]
            + sign[None, None, :] * delta[None, :, None])
+    if sigma_idio:
+        lin = lin + rng.normal(0, sigma_idio, (n_cases, n_cantons, 2))
     return expit(lin)
 
 
@@ -135,8 +195,9 @@ def random_baseline(p, slots):
     }
 
 
-def one_replication(n_cases, sigma_interact, rng):
-    p = draw_probabilities(n_cases, sigma_interact, rng)
+def one_replication(n_cases, sigma_interact, rng, rho_case=RHO_CASE,
+                    sigma_idio=SIGMA_IDIO):
+    p = draw_probabilities(n_cases, sigma_interact, rng, rho_case, sigma_idio)
     slots = capacity_slots(n_cases)
 
     out = {"baseline": random_baseline(p, slots)}
@@ -160,9 +221,11 @@ def one_replication(n_cases, sigma_interact, rng):
     return out
 
 
-def monte_carlo(n_reps=120, n_cases=400, sigma_interact=SIGMA_INTERACT, seed=20260827):
+def monte_carlo(n_reps=120, n_cases=400, sigma_interact=SIGMA_INTERACT, seed=20260827,
+                rho_case=RHO_CASE, sigma_idio=SIGMA_IDIO):
     rng = np.random.default_rng(seed)
-    reps = [one_replication(n_cases, sigma_interact, rng) for _ in range(n_reps)]
+    reps = [one_replication(n_cases, sigma_interact, rng, rho_case, sigma_idio)
+            for _ in range(n_reps)]
 
     def collect(path):
         if isinstance(path, tuple):
@@ -173,7 +236,8 @@ def monte_carlo(n_reps=120, n_cases=400, sigma_interact=SIGMA_INTERACT, seed=202
     print(f"Monte Carlo: {n_reps} draws of cantonal effects, {n_cases} two-adult "
           f"households each")
     print(f"sigma_canton={SIGMA_CANTON}, sigma_interaction={sigma_interact}, "
-          f"sigma_individual={SIGMA_INDIV}")
+          f"sigma_individual={SIGMA_INDIV}, rho_case={rho_case}, "
+          f"sigma_idio={sigma_idio}")
     print(f"{'='*78}")
 
     base_emp = collect(("baseline", "employed_per_case"))
@@ -196,6 +260,27 @@ def monte_carlo(n_reps=120, n_cases=400, sigma_interact=SIGMA_INTERACT, seed=202
               f"{collect((name,'p_female')).mean():>9.4f}"
               f"{collect((name,'p_male')).mean():>9.4f}"
               f"{collect((name,'within_case_gap')).mean():>9.4f}")
+    print("-" * 78)
+
+    def interval(x, fmt=".4f"):
+        return (f"[{np.quantile(x, 0.05):{fmt}}, {np.quantile(x, 0.95):{fmt}}]")
+
+    print("\n90% Monte Carlo intervals across the parameter draws "
+          "(5th to 95th percentile).")
+    print("These describe dispersion over the stylised cantonal parameters, "
+          "not sampling error.")
+    for name in ("status quo",) + tuple(RULES):
+        key = "baseline" if name == "status quo" else name
+        emp = collect((key, "employed_per_case"))
+        line = (f"  {name:<13} employed/hh {emp.mean():.4f} {interval(emp)}"
+                f"   P(f) {collect((key,'p_female')).mean():.4f} "
+                f"{interval(collect((key,'p_female')))}"
+                f"   gap {collect((key,'within_case_gap')).mean():.4f} "
+                f"{interval(collect((key,'within_case_gap')))}")
+        if name != "status quo":
+            gain = 100 * (emp / base_emp - 1)
+            line += f"   gain {gain.mean():+.1f}% {interval(gain, '+.1f')}"
+        print(line)
 
     print("-" * 78)
     alo = collect(("at-least-one", "employed_per_case"))
@@ -237,7 +322,11 @@ def monte_carlo(n_reps=120, n_cases=400, sigma_interact=SIGMA_INTERACT, seed=202
     return reps
 
 
-def sensitivity(sigmas=(0.10, 0.20, 0.30, 0.40, 0.50), n_reps=40, n_cases=300):
+def sensitivity(sigmas=(0.10, 0.20, 0.30, 0.40, 0.50), n_reps=40, n_cases=300,
+                seed=20260827):
+    """Common random numbers across sigma values. Called with the same seed,
+    n_reps and n_cases as monte_carlo(), the sigma=0.30 row reproduces the
+    main-table replications exactly, so the two series can be quoted together."""
     print(f"\n{'='*78}")
     print("Sensitivity to the strength of the canton-by-gender interaction")
     print(f"{'='*78}")
@@ -245,7 +334,7 @@ def sensitivity(sigmas=(0.10, 0.20, 0.30, 0.40, 0.50), n_reps=40, n_cases=300):
           f"{'eff. forgone':>15}{'women pp':>11}")
     print("-" * 78)
     for s in sigmas:
-        rng = np.random.default_rng(4711)
+        rng = np.random.default_rng(seed)
         reps = [one_replication(n_cases, s, rng) for _ in range(n_reps)]
         base = np.array([r["baseline"]["employed_per_case"] for r in reps])
         alo = np.array([r["at-least-one"]["employed_per_case"] for r in reps])
@@ -275,10 +364,18 @@ SIZE_WEIGHTS = {1: 0.35, 2: 0.30, 3: 0.20, 4: 0.15}   # stylised household-size 
 MAX_SIZE = max(SIZE_WEIGHTS)
 
 
-def draw_probabilities_varsize(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG):
+def draw_probabilities_varsize(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG,
+                               rho_case=RHO_CASE, sigma_idio=SIGMA_IDIO):
     """Households of size 1-4 (stylised mix). Returns:
       p     : (n_cases, n_cantons, MAX_SIZE), zero-padded for absent members
       sizes : (n_cases,) integer household size
+
+    sigma_idio is the standard deviation of person-by-canton idiosyncratic
+    match quality on the logit scale. At sigma_idio=0 all households rank the
+    cantons in nearly the same order, so being deprioritised by the matching
+    stage means receiving the commonly-worst cantons. Positive values break
+    that common ordering and are what a location-specific gradient-boosted
+    model would find.
     """
     n_cantons = len(CANTON_KEY)
     sizes = rng.choice(list(SIZE_WEIGHTS.keys()), size=n_cases,
@@ -291,12 +388,16 @@ def draw_probabilities_varsize(n_cases, sigma_interact=SIGMA_INTERACT, rng=RNG):
     delta -= delta.mean()
 
     gender = rng.integers(0, 2, (n_cases, MAX_SIZE))          # 0=man, 1=woman
-    u = rng.normal(0, SIGMA_INDIV, (n_cases, MAX_SIZE))
-    base = np.where(gender == 0, logit(P_MALE), logit(P_FEMALE))
+    u = draw_individual_effects(n_cases, MAX_SIZE, rho_case, rng)
+    sigma_person = np.hypot(SIGMA_INDIV, sigma_idio)
+    base = np.where(gender == 0, intercept_for(P_MALE, sigma_person),
+                    intercept_for(P_FEMALE, sigma_person))
     sign = np.where(gender == 0, -1.0, 1.0)
 
     lin = (base[:, None, :] + u[:, None, :] + beta[None, :, None]
            + sign[:, None, :] * delta[None, :, None])
+    if sigma_idio:
+        lin = lin + rng.normal(0, sigma_idio, (n_cases, n_cantons, MAX_SIZE))
     p = expit(lin) * mask[:, None, :]     # padding members contribute (1-0)=1 to the product
     return p, sizes
 
@@ -322,118 +423,221 @@ def canton_rank(quality, chosen):
     return rank_of[np.arange(quality.shape[0]), chosen]
 
 
-def size_effect(n_reps=150, n_cases=600, seed=20260828):
+SIZE_RULES = ("at-least-one", "mean", "sum", "lottery")
+
+# Two yardsticks for "how good is the canton this household actually received?",
+# both independent of the matching rules being compared:
+#   per-person : the household's own mean employment probability. Because
+#                sum = size * mean within a household, ranking cantons by the
+#                per-person mean and by the expected number of employed members
+#                gives the same order, so this yardstick does not favour the
+#                mean rule over the sum rule.
+#   worst-off  : the employment probability of the household's least employable
+#                member -- a yardstick none of the four rules maximises.
+YARDSTICKS = ("per-person", "worst-off")
+
+
+def _quality(p, sizes, yardstick):
+    if yardstick == "per-person":
+        return phi_mean_sized(p, sizes)
+    present = np.arange(MAX_SIZE)[None, None, :] < sizes[:, None, None]
+    return np.where(present, p, 2.0).min(axis=-1)
+
+
+def size_effect(n_reps=150, n_cases=600, seed=20260828, rho_case=RHO_CASE,
+                sigma_idio=SIGMA_IDIO, verbose=True):
     """Does the at-least-one rule send larger households to cantons that are
-    worse for their own true (mean-probability) prospects, relative to the
-    mean rule and the characteristics-blind lottery?"""
+    worse by their own reckoning than the mean rule, the sum rule and the
+    characteristics-blind lottery would have given them?
+
+    Reported for both yardsticks in YARDSTICKS. sigma_idio controls whether
+    households differ in which cantons suit them: at sigma_idio=0 the ordering
+    is common to everyone of a given gender, so a deprioritised household
+    receives the commonly-worst cantons and can fall below the lottery. Whether
+    that crossing survives idiosyncratic match quality is what the grid in
+    size_effect_idio() tests.
+    """
     rng = np.random.default_rng(seed)
     sizes_seen = sorted(SIZE_WEIGHTS)
     n_cantons = len(CANTON_KEY)
+    bottom_cut = 0.75 * n_cantons
 
-    sums = {s: {"alo_rank": 0.0, "mean_rank": 0.0, "base_rank": 0.0,
-                "alo_q": 0.0, "mean_q": 0.0, "base_q": 0.0,
-                "alo_bottomq": 0.0, "base_bottomq": 0.0,
-                "ceiling": 0.0, "floor": 0.0, "spread": 0.0,
-                "regret_alo": 0.0, "regret_mean": 0.0, "regret_base": 0.0, "n": 0}
-            for s in sizes_seen}
+    keys = ["n", "spread", "lottery_quality"]
+    acc = {(s, y): {**{k: 0.0 for k in keys},
+                    **{f"rank:{r}": 0.0 for r in SIZE_RULES},
+                    **{f"regret:{r}": 0.0 for r in SIZE_RULES},
+                    **{f"bottomq:{r}": 0.0 for r in SIZE_RULES}}
+           for s in sizes_seen for y in YARDSTICKS}
 
     for _ in range(n_reps):
-        p, sizes = draw_probabilities_varsize(n_cases, rng=rng)
+        p, sizes = draw_probabilities_varsize(n_cases, rng=rng, rho_case=rho_case,
+                                              sigma_idio=sigma_idio)
         slots = capacity_slots(n_cases)
-        quality = phi_mean_sized(p, sizes)          # "true" per-member employment prospect
+        rows = np.arange(n_cases)
 
-        chosen_alo = constrained_assignment(phi_at_least_one(p), slots)
-        chosen_mean = constrained_assignment(quality, slots)
-        chosen_base = random_assignment(n_cases, slots, rng)
+        chosen = {
+            "at-least-one": constrained_assignment(phi_at_least_one(p), slots),
+            "mean": constrained_assignment(phi_mean_sized(p, sizes), slots),
+            "sum": constrained_assignment(phi_sum(p), slots),
+            "lottery": random_assignment(n_cases, slots, rng),
+        }
 
-        rank_alo = canton_rank(quality, chosen_alo)
-        rank_mean = canton_rank(quality, chosen_mean)
-        rank_base = canton_rank(quality, chosen_base)
+        for y in YARDSTICKS:
+            quality = _quality(p, sizes, y)
+            ceiling = quality.max(axis=1)
+            spread = ceiling - quality.min(axis=1)
+            rank = {r: canton_rank(quality, c) for r, c in chosen.items()}
+            got = {r: quality[rows, c] for r, c in chosen.items()}
 
-        q_alo = quality[np.arange(n_cases), chosen_alo]
-        q_mean = quality[np.arange(n_cases), chosen_mean]
-        q_base = quality[np.arange(n_cases), chosen_base]
+            for s in sizes_seen:
+                m = sizes == s
+                d = acc[(s, y)]
+                d["n"] += m.sum()
+                d["spread"] += spread[m].sum()
+                d["lottery_quality"] += got["lottery"][m].sum()
+                for r in SIZE_RULES:
+                    d[f"rank:{r}"] += rank[r][m].sum()
+                    d[f"regret:{r}"] += (ceiling[m] - got[r][m]).sum()
+                    d[f"bottomq:{r}"] += (rank[r][m] > bottom_cut).sum()
 
-        # cardinal ("how much is actually at stake") counterparts to the ordinal rank:
-        ceiling = quality.max(axis=1)       # this household's best-case canton, in probability
-        floor = quality.min(axis=1)         # this household's worst-case canton
-        spread = ceiling - floor            # how much the canton choice could possibly matter
+    means = {(s, y): {k: v / acc[(s, y)]["n"] for k, v in acc[(s, y)].items()
+                      if k != "n"}
+             for s in sizes_seen for y in YARDSTICKS}
+    for (s, y) in means:
+        means[(s, y)]["n"] = acc[(s, y)]["n"]
+    for y in YARDSTICKS:
+        n_all = sum(acc[(s, y)]["n"] for s in sizes_seen)
+        means[("ALL", y)] = {k: sum(acc[(s, y)][k] for s in sizes_seen) / n_all
+                             for k in acc[(sizes_seen[0], y)] if k != "n"}
+        means[("ALL", y)]["n"] = n_all
 
-        bottom_cut = 0.75 * n_cantons
-        for s in sizes_seen:
-            m = sizes == s
-            n = m.sum()
-            sums[s]["alo_rank"] += rank_alo[m].sum()
-            sums[s]["mean_rank"] += rank_mean[m].sum()
-            sums[s]["base_rank"] += rank_base[m].sum()
-            sums[s]["alo_q"] += q_alo[m].sum()
-            sums[s]["mean_q"] += q_mean[m].sum()
-            sums[s]["base_q"] += q_base[m].sum()
-            sums[s]["alo_bottomq"] += (rank_alo[m] > bottom_cut).sum()
-            sums[s]["base_bottomq"] += (rank_base[m] > bottom_cut).sum()
-            sums[s]["ceiling"] += ceiling[m].sum()
-            sums[s]["floor"] += floor[m].sum()
-            sums[s]["spread"] += spread[m].sum()
-            sums[s]["regret_alo"] += (ceiling[m] - q_alo[m]).sum()
-            sums[s]["regret_mean"] += (ceiling[m] - q_mean[m]).sum()
-            sums[s]["regret_base"] += (ceiling[m] - q_base[m]).sum()
-            sums[s]["n"] += n
+    if not verbose:
+        return means
 
-    print(f"\n{'='*90}")
+    print(f"\n{'='*100}")
     print(f"Household-size effect: {n_reps} draws x {n_cases} households "
-          f"(size mix {SIZE_WEIGHTS}), {n_cantons} cantons")
-    print("quality = each household's own mean employment probability (not the score "
-          "it was matched on)")
+          f"(size mix {SIZE_WEIGHTS}), {n_cantons} cantons,")
+    print(f"rho_case={rho_case}, sigma_idio={sigma_idio}")
+    print(f"{'='*100}")
+    for y in YARDSTICKS:
+        label = ("each household's own mean employment probability"
+                 if y == "per-person"
+                 else "the employment probability of the household's least "
+                      "employable member")
+        print(f"\nYardstick: {y} -- {label},")
+        print("  evaluated at the canton received, not at the score it was matched on.")
+        print(f"{'size':>5}{'n':>9}{'rank: alo':>12}{'rank: mean':>12}"
+              f"{'rank: sum':>11}{'rank: lot.':>12}{'bottomQ: alo':>14}"
+              f"{'bottomQ: lot.':>15}{'regret: alo':>13}{'regret: mean':>14}"
+              f"{'regret: lot.':>14}")
+        print("-" * 114)
+        for s in sizes_seen + ["ALL"]:
+            d = means[(s, y)]
+            print(f"{str(s):>5}{int(d['n']):>9}{d['rank:at-least-one']:>12.2f}"
+                  f"{d['rank:mean']:>12.2f}{d['rank:sum']:>11.2f}"
+                  f"{d['rank:lottery']:>12.2f}"
+                  f"{100*d['bottomq:at-least-one']:>13.1f}%"
+                  f"{100*d['bottomq:lottery']:>14.1f}%"
+                  f"{d['regret:at-least-one']:>13.4f}"
+                  f"{d['regret:mean']:>14.4f}"
+                  f"{d['regret:lottery']:>14.4f}")
+        print("-" * 114)
+    print("rank: 1 = the best of 26 cantons on that yardstick, 26 = the worst; the "
+          "lottery's 13.5 is the")
+    print("  midpoint and the benchmark of the Random fairness rule.")
+    print("bottomQ: share of households sent to a canton in their own worst quartile "
+          "(lottery: 26.7%).")
+    print("regret: own best-canton quality minus what was received, in probability "
+          "units -- a")
+    print("  feasibility-blind upper bound, not a claim that regret 0 is attainable "
+          "for everyone")
+    print("  at once under capacity constraints.")
+    print(f"ALL = pooled across the stylised size mix {SIZE_WEIGHTS}: what you would "
+          f"see if you")
+    print("  ignored household size altogether.")
+    return means
+
+
+def size_effect_idio(sigmas=(0.0, 0.15, 0.30, 0.60), n_reps=150, n_cases=600,
+                     seed=20260828):
+    """Does the size effect survive idiosyncratic person-by-canton match quality?
+
+    At sigma_idio=0 every household ranks the cantons in nearly the same order,
+    so being deprioritised means receiving the cantons that are worst for
+    everyone. Positive sigma_idio breaks the common ordering: the residual
+    slots a deprioritised household receives are then less systematically bad
+    for it, which should pull every rule toward the lottery's rank of 13.5.
+    """
+    print(f"\n{'='*100}")
+    print("Robustness of the size effect to idiosyncratic person-by-canton "
+          "match quality")
+    print(f"{'='*100}")
+    for y in YARDSTICKS:
+        print(f"\nYardstick: {y}")
+        print(f"{'sigma_idio':>11}{'size':>6}{'rank: alo':>12}{'rank: mean':>12}"
+              f"{'rank: sum':>11}{'rank: lot.':>12}{'alo - lottery':>15}"
+              f"{'bottomQ: alo':>14}{'own spread':>12}")
+        print("-" * 100)
+        for sig in sigmas:
+            means = size_effect(n_reps=n_reps, n_cases=n_cases, seed=seed,
+                                sigma_idio=sig, verbose=False)
+            for s in sorted(SIZE_WEIGHTS) + ["ALL"]:
+                d = means[(s, y)]
+                delta = d["rank:at-least-one"] - d["rank:lottery"]
+                print(f"{sig:>11.2f}{str(s):>6}{d['rank:at-least-one']:>12.2f}"
+                      f"{d['rank:mean']:>12.2f}{d['rank:sum']:>11.2f}"
+                      f"{d['rank:lottery']:>12.2f}{delta:>+15.2f}"
+                      f"{100*d['bottomq:at-least-one']:>13.1f}%"
+                      f"{d['spread']:>12.4f}")
+            print("-" * 100)
+    print("'alo - lottery' > 0 means the at-least-one rule leaves that size worse, by "
+          "its own")
+    print("  reckoning, than the characteristics-blind lottery: a Random fairness "
+          "violation.")
+    print("own spread: best minus worst canton on that household's own yardstick -- how "
+          "much the")
+    print("  canton choice could possibly be worth to it.")
+
+
+def idio_sensitivity(sigmas=(0.0, 0.30, 0.60), n_reps=150, n_cases=600,
+                     seed=20260827):
+    """The gender/efficiency results of monte_carlo() under idiosyncratic
+    person-by-canton match quality, which the baseline specification omits."""
+    print(f"\n{'='*90}")
+    print("Robustness to idiosyncratic person-by-canton match quality")
     print(f"{'='*90}")
-    print(f"{'size':>5}{'n':>9}{'  rank: at-least-one':>21}{'rank: mean':>13}"
-          f"{'rank: lottery':>15}{'quality: alo':>14}{'quality: mean':>15}"
-          f"{'bottom-Q%: alo':>16}{'bottom-Q%: lot.':>17}")
+    print(f"{'sigma_idio':>11}{'eff. forgone (alo vs mean)':>29}"
+          f"{'gap vs status quo':>20}{'women pp (mean - alo)':>24}")
     print("-" * 90)
-    for s in sizes_seen:
-        d = sums[s]
-        n = d["n"]
-        print(f"{s:>5}{n:>9}{d['alo_rank']/n:>21.2f}{d['mean_rank']/n:>13.2f}"
-              f"{d['base_rank']/n:>15.2f}{d['alo_q']/n:>14.4f}{d['mean_q']/n:>15.4f}"
-              f"{100*d['alo_bottomq']/n:>15.1f}%{100*d['base_bottomq']/n:>16.1f}%")
+    for sig in sigmas:
+        rng = np.random.default_rng(seed)
+        reps = [one_replication(n_cases, SIGMA_INTERACT, rng, RHO_CASE, sig)
+                for _ in range(n_reps)]
+        base = np.array([r["baseline"]["employed_per_case"] for r in reps])
+        alo = np.array([r["at-least-one"]["employed_per_case"] for r in reps])
+        mn = np.array([r["mean"]["employed_per_case"] for r in reps])
+        forgone = (100 * (mn / base - 1) - 100 * (alo / base - 1)).mean()
+        gap_d = 100 * np.mean([r["at-least-one"]["within_case_gap"]
+                               - r["baseline"]["within_case_gap"] for r in reps])
+        fem = 100 * np.mean([r["mean"]["p_female"] - r["at-least-one"]["p_female"]
+                             for r in reps])
+        print(f"{sig:>11.2f}{forgone:>27.2f}pp{gap_d:>+18.2f}pp{fem:>+22.2f}pp")
     print("-" * 90)
-    print("\nCardinal counterparts (probability units, not rank):")
-    print(f"{'size':>5}{'n':>9}{'own spread (max-min)':>22}{'quality: lottery':>18}"
-          f"{'regret: alo':>13}{'regret: mean':>14}{'regret: lottery':>17}")
-    print("-" * 90)
-    for s in sizes_seen:
-        d = sums[s]
-        n = d["n"]
-        print(f"{s:>5}{n:>9}{d['spread']/n:>22.4f}{d['base_q']/n:>18.4f}"
-              f"{d['regret_alo']/n:>13.4f}{d['regret_mean']/n:>14.4f}"
-              f"{d['regret_base']/n:>17.4f}")
-    print("-" * 90)
-    print("own spread: this household's own best-canton quality minus its own worst-canton")
-    print("  quality -- how much the canton choice could possibly be worth to it.")
-    print("regret: this household's own best-canton quality minus what it actually got")
-    print("  under each rule -- a feasibility-blind upper bound, not a claim that regret 0")
-    print("  is attainable for everyone at once under capacity constraints.")
-    # Pooled across sizes at their actual mix (SIZE_WEIGHTS) -- answers "does this
-    # wash out in the population average if large households are a minority?"
-    n_all = sum(sums[s]["n"] for s in sizes_seen)
-    alo_all = sum(sums[s]["alo_rank"] for s in sizes_seen) / n_all
-    mean_all = sum(sums[s]["mean_rank"] for s in sizes_seen) / n_all
-    base_all = sum(sums[s]["base_rank"] for s in sizes_seen) / n_all
-    bq_alo_all = 100 * sum(sums[s]["alo_bottomq"] for s in sizes_seen) / n_all
-    bq_base_all = 100 * sum(sums[s]["base_bottomq"] for s in sizes_seen) / n_all
-    print(f"{'ALL':>5}{n_all:>9}{alo_all:>21.2f}{mean_all:>13.2f}{base_all:>15.2f}"
-          f"{'':>14}{'':>15}{bq_alo_all:>15.1f}%{bq_base_all:>16.1f}%")
-    print("-" * 90)
-    print("rank: 1 = the best of 26 cantons for that household's own prospects, "
-          "26 = the worst.")
-    print("bottom-Q%: share of households sent to a canton in their own worst quartile.")
-    print(f"ALL = pooled across the stylised size mix {SIZE_WEIGHTS}: the population-wide "
-          f"average, i.e. what you would see if you ignored household size altogether.")
+    print("all columns: at-least-one relative to the stated comparator; positive")
+    print("  'gap vs status quo' means the within-household gap widens.")
 
 
-def gender_rank_effect(n_reps=200, n_cases=800, sigma_interact=SIGMA_INTERACT, seed=20260828):
+def gender_rank_effect(n_reps=200, n_cases=800, sigma_interact=SIGMA_INTERACT,
+                       seed=20260828, sigma_idio=SIGMA_IDIO):
     """Individual analogue of size_effect: rank the assigned canton against each
     person's OWN individual employment probability (not the household score),
-    separately for men and women, under each rule."""
+    separately for men and women, under each rule.
+
+    At sigma_idio=0 this is degenerate: the individual effect is a
+    canton-invariant shift, so everyone of a given gender ranks the cantons
+    identically and every feasible assignment fills each canton to capacity,
+    making the rank distribution the same under every rule. Run it with
+    sigma_idio>0 for it to be informative."""
     rng = np.random.default_rng(seed)
     n_cantons = len(CANTON_KEY)
     labels = {0: "men", 1: "women"}
@@ -441,7 +645,8 @@ def gender_rank_effect(n_reps=200, n_cases=800, sigma_interact=SIGMA_INTERACT, s
                 "alo_bottomq": 0.0, "base_bottomq": 0.0, "n": 0} for g in (0, 1)}
 
     for _ in range(n_reps):
-        p = draw_probabilities(n_cases, sigma_interact, rng)     # (n_cases, n_cantons, 2)
+        p = draw_probabilities(n_cases, sigma_interact, rng,
+                               sigma_idio=sigma_idio)   # (n_cases, n_cantons, 2)
         slots = capacity_slots(n_cases)
         chosen_alo = constrained_assignment(phi_at_least_one(p), slots)
         chosen_mean = constrained_assignment(phi_mean(p), slots)
@@ -478,22 +683,114 @@ def gender_rank_effect(n_reps=200, n_cases=800, sigma_interact=SIGMA_INTERACT, s
     print("rank: 1 = the best of 26 cantons for that person's own prospects, 26 = the worst.")
 
 
-def high_synergy():
-    """Stronger canton effects, closer to the synergies a full GBM can exploit."""
-    global SIGMA_CANTON
-    saved = SIGMA_CANTON
-    SIGMA_CANTON = 0.60
-    print(f"\n{'#'*78}")
-    print("HIGH-SYNERGY SCENARIO (sigma_canton=0.60)")
-    print(f"{'#'*78}")
-    monte_carlo(n_reps=80, n_cases=400, sigma_interact=0.50, seed=99)
-    SIGMA_CANTON = saved
+def sum_vs_mean_check(n_cases=600, n_reps=20, seed=20260829):
+    """With all cases the same size, cost = 1 - sum is a positive affine transform
+    of cost = 1 - mean, so the two rules must produce the same assignment."""
+    rng = np.random.default_rng(seed)
+    disagree = []
+    for _ in range(n_reps):
+        p = draw_probabilities(n_cases, rng=rng)
+        slots = capacity_slots(n_cases)
+        a = constrained_assignment(phi_mean(p), slots)
+        b = constrained_assignment(phi_sum(p), slots)
+        disagree.append(np.mean(a != b))
+    print(f"\nsum vs mean under equal household size: "
+          f"{100*np.mean(disagree):.1f}% of households assigned differently "
+          f"({n_reps} draws x {n_cases} cases)")
+
+
+def within_case_correlation(rhos=(0.0, 0.3, 0.6), n_reps=60, n_cases=500,
+                            seed=20260830):
+    """Robustness to members of a household resembling each other. rho is the
+    share of individual logit-scale variance shared within the case."""
+    print(f"\n{'='*90}")
+    print("Robustness to within-household correlation of individual effects")
+    print(f"{'='*90}")
+    print(f"{'rho':>6}{'eff. forgone (alo vs mean)':>29}{'gap vs status quo':>20}"
+          f"{'women pp (mean - alo)':>24}")
+    print("-" * 90)
+    for rho in rhos:
+        rng = np.random.default_rng(seed)
+        reps = [one_replication(n_cases, SIGMA_INTERACT, rng, rho)
+                for _ in range(n_reps)]
+        base = np.array([r["baseline"]["employed_per_case"] for r in reps])
+        alo = np.array([r["at-least-one"]["employed_per_case"] for r in reps])
+        mn = np.array([r["mean"]["employed_per_case"] for r in reps])
+        forgone = (100 * (mn / base - 1) - 100 * (alo / base - 1)).mean()
+        gap_d = 100 * np.mean([r["at-least-one"]["within_case_gap"]
+                               - r["baseline"]["within_case_gap"] for r in reps])
+        fem = 100 * np.mean([r["mean"]["p_female"] - r["at-least-one"]["p_female"]
+                             for r in reps])
+        print(f"{rho:>6.1f}{forgone:>27.2f}pp{gap_d:>+18.2f}pp{fem:>+22.2f}pp")
+    print("-" * 90)
+    print("all columns: at-least-one relative to the stated comparator; positive")
+    print("  'gap vs status quo' means the within-household gap widens.")
+
+
+def calibration(sigmas=(0.0, 0.5, 1.0, 2.0, 3.5), n_reps=40, n_cases=500,
+                seed=20260827):
+    """Pin SIGMA_IDIO to the published effect size.
+
+    Bansak et al. (2018) report employment gains over existing assignment
+    practice of roughly 40-70%, the U.S. backtest figure being 41% under the
+    deployed at-least-one rule. How much a location can be worth to a person is
+    exactly what the person-by-canton term governs, so that gain identifies it:
+    with no such term the achievable gain is ~1%, two orders of magnitude below
+    what the tool is documented to deliver, and the simulated matching problem
+    is not the one the tool solves.
+    """
+    print(f"\n{'='*90}")
+    print("Calibration of sigma_idio against the published employment gain")
+    print(f"{'='*90}")
+    print(f"{'sigma_idio':>11}{'gain: at-least-one':>20}{'gain: mean':>13}"
+          f"{'P(m), status quo':>19}{'P(f), status quo':>19}")
+    print("-" * 90)
+    for sig in sigmas:
+        rng = np.random.default_rng(seed)
+        reps = [one_replication(n_cases, SIGMA_INTERACT, rng, RHO_CASE, sig)
+                for _ in range(n_reps)]
+        base = np.array([r["baseline"]["employed_per_case"] for r in reps])
+        alo = np.array([r["at-least-one"]["employed_per_case"] for r in reps])
+        mn = np.array([r["mean"]["employed_per_case"] for r in reps])
+        pm = np.mean([r["baseline"]["p_male"] for r in reps])
+        pf = np.mean([r["baseline"]["p_female"] for r in reps])
+        print(f"{sig:>11.2f}{100*(alo/base-1).mean():>19.1f}%"
+              f"{100*(mn/base-1).mean():>12.1f}%{pm:>19.4f}{pf:>19.4f}")
+    print("-" * 90)
+    print("Target: the 41% gain of the U.S. backtest under the deployed "
+          "at-least-one rule, and")
+    print("  the 47% its mean variant reaches (Bansak et al. 2018, fig. S8). "
+          "sigma_idio = 1.0")
+    print("  reproduces both within about two points, so the specification is "
+          "pinned by the")
+    print("  published pair rather than chosen. sigma_idio = 2.0 is carried as an "
+          "upper bracket.")
+    print("The 73% reported for the Swiss backtest is not a target here: Swiss "
+          "employment three")
+    print("  years after arrival is far below the 7-year rates used for "
+          "calibration, and a given")
+    print("  absolute improvement is a larger relative gain the lower the base "
+          "rate. Under these")
+    print("  base rates the at-least-one rule's own gain saturates near 60% "
+          "however large")
+    print("  sigma_idio grows, while the mean rule's keeps rising -- a first sign "
+          "of the")
+    print("  ceiling that the rest of the analysis quantifies.")
+    print("P(m)/P(f) under the status quo hold at the SEM base rates across all "
+          "rows because the")
+    print("  intercepts are re-solved for each sigma (see intercept_for), so the "
+          "rows differ in")
+    print("  synergy alone.")
 
 
 if __name__ == "__main__":
     minimal_example()
+    calibration()
     monte_carlo()
     sensitivity()
-    high_synergy()
+    idio_sensitivity()
+    within_case_correlation()
+    sum_vs_mean_check()
     size_effect()
+    size_effect_idio()
     gender_rank_effect()
