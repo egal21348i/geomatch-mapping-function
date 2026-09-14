@@ -1,7 +1,7 @@
 # Whose Efficiency? The Undefended Normative Core of Algorithmic Refugee Assignment
 
 Julian Weide  
-Fairness and Algorithms (851-0746-00L), ETH Zurich, Spring 2026
+Algorithms and Fairness (851-0746-00L), ETH Zurich, Spring 2026
 
 *Replication code:* <https://github.com/egal21348i/geomatch-mapping-function>
 

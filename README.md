@@ -1,6 +1,6 @@
 # Whose Efficiency? The Undefended Normative Core of Algorithmic Refugee Assignment
 
-Term paper and replication code for *Fairness and Algorithms* (851-0746-00L), ETH Zurich, Spring 2026.
+Term paper and replication code for *Algorithms and Fairness* (851-0746-00L), ETH Zurich, Spring 2026.
 
 Julian Weide
 
